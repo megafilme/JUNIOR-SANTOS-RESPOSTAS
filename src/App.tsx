@@ -1,113 +1,174 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import { useDropzone } from "react-dropzone";
-import * as XLSX from "xlsx";
 import TruckScene from "./components/TruckScene";
 import JustificativaCard from "./components/JustificativaCard";
-import {
-  gerarJustificativas,
-  gerarJustificativasDePlanilha,
-  PlanilhaRow,
-} from "./utils/gerarJustificativas";
+import PlanilhaWorker from "./workers/planilha.worker?worker";
 
+// ─── tipos ────────────────────────────────────────────────────────────────────
+type PlanilhaRow = Record<string, string>;
+
+type WorkerOutMsg =
+  | { type: "parsed"; rows: PlanilhaRow[]; cabecalhos: string[] }
+  | { type: "progress"; done: number; total: number; batch: string[] }
+  | { type: "done"; total: number }
+  | { type: "error"; message: string };
+
+// ─── hook do worker ───────────────────────────────────────────────────────────
+function useWorker() {
+  const workerRef = useRef<Worker | null>(null);
+
+  useEffect(() => {
+    workerRef.current = new PlanilhaWorker();
+    return () => workerRef.current?.terminate();
+  }, []);
+
+  return workerRef;
+}
+
+// ─── gerador de texto colado (roda na thread principal — é rápido) ────────────
+function gerarDeTexto(lines: string[]): string[] {
+  const FECHOS = [
+    "Movimentação necessária para continuidade das operações da unidade.",
+    "Ação essencial para suporte logístico e administrativo da unidade.",
+    "Necessário para regularização e atendimento da demanda registrada.",
+    "Essencial para garantir o fluxo operacional e atendimento ao solicitante.",
+    "Movimentação autorizada conforme necessidade operacional vigente.",
+    "Atendimento realizado dentro dos parâmetros logísticos estabelecidos.",
+    "Demanda cumprida em conformidade com o processo interno da unidade.",
+  ];
+
+  function ext(line: string, keys: string[]): string {
+    for (const key of keys) {
+      const r = new RegExp(key + "[:\\s]+([^|\\n;,]{2,60})", "i");
+      const m = line.match(r);
+      if (m) return m[1].trim();
+    }
+    return "";
+  }
+
+  function cap(s: string) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
+
+  return lines.map((line, idx) => {
+    const coleta = ext(line, ["coleta", "origem", "retirada"]);
+    const entrega = ext(line, ["entrega", "destino"]);
+    const material = ext(line, ["material", "item", "produto", "carga"]);
+    const motorista = ext(line, ["motorista", "condutor"]);
+    const veiculo = ext(line, ["veiculo", "placa", "frota"]);
+    const solicitante = ext(line, ["solicitante", "solicitado por", "aprovado por"]);
+    const st =
+      ext(line, ["st", "ocorrencia", "chamado"]) ||
+      (line.match(/\bst[:\s#-]*(\d{4,7})\b/i) || [])[1] || "";
+    const ordemInterna =
+      ext(line, ["ordem interna", "ordem"]) ||
+      (line.match(/\b([A-Z]{2}\d{2}[A-Z]\d{4})\b/) || [])[1] || "";
+    const valor =
+      ext(line, ["valor", "total"]) ||
+      (line.match(/R\$[\s]?[\d.,]+/i) || [])[0] || "";
+    const email = (line.match(/[\w.+-]+@electrolux\.com\.br/i) || [])[0] || "";
+    const debora = /d[eé]bora/i.test(line);
+
+    const ls: string[] = [];
+    if (material && coleta && entrega)
+      ls.push(`Coleta e entrega de ${material.toLowerCase()}, saída de ${cap(coleta)} e destino em ${cap(entrega)}.`);
+    else if (coleta && entrega)
+      ls.push(`Coleta e entrega de material com saída de ${cap(coleta)} e destino em ${cap(entrega)}.`);
+    else if (material)
+      ls.push(`Movimentação de ${material.toLowerCase()} conforme demanda registrada.`);
+    else if (coleta)
+      ls.push(`Coleta de material realizada em ${cap(coleta)}.`);
+    else if (entrega)
+      ls.push(`Entrega de material realizada em ${cap(entrega)}.`);
+    else
+      ls.push(`Movimentação operacional necessária para suporte à unidade.`);
+
+    const infos: string[] = [];
+    if (veiculo) infos.push(`Veículo/Placa: ${veiculo}`);
+    if (motorista) infos.push(`Motorista: ${cap(motorista)}`);
+    if (infos.length) ls.push(infos.join(" · ") + ".");
+
+    if (st || ordemInterna) {
+      const reg: string[] = [];
+      if (st) reg.push(`Ocorrência/ST nº ${st}`);
+      if (ordemInterna) reg.push(`Ordem Interna: ${ordemInterna}`);
+      ls.push(`Atendimento referente a: ${reg.join(" | ")}.`);
+    }
+
+    if (debora && email) ls.push(`Solicitado e aprovado por Débora Alvelino (${email}).`);
+    else if (debora) ls.push(`Solicitado e aprovado por Débora Alvelino.`);
+    else if (solicitante) ls.push(`Solicitado por ${cap(solicitante)}.`);
+    else if (email) ls.push(`Solicitação recebida via ${email}.`);
+
+    if (valor) ls.push(`Valor envolvido: ${valor.startsWith("R$") ? valor : `R$ ${valor}`}.`);
+    ls.push(FECHOS[idx % FECHOS.length]);
+    return ls.join("\n");
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 export default function App() {
+  const workerRef = useWorker();
+
   const [pastedText, setPastedText] = useState("");
   const [justificativas, setJustificativas] = useState<string[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [fileName, setFileName] = useState("");
   const [activeTab, setActiveTab] = useState<"upload" | "colar">("upload");
   const [error, setError] = useState("");
   const [copyAllDone, setCopyAllDone] = useState(false);
 
-  // Dados da planilha carregada (mas ainda não gerada)
+  // estados da planilha
+  const [fileName, setFileName] = useState("");
   const [planilhaRows, setPlanilhaRows] = useState<PlanilhaRow[]>([]);
   const [planilhaCabecalhos, setPlanilhaCabecalhos] = useState<string[]>([]);
   const [planilhaPreview, setPlanilhaPreview] = useState<PlanilhaRow[]>([]);
 
-  // ── Leitura do arquivo ──────────────────────────────────────────────────────
-  const processFile = useCallback((file: File) => {
-    setError("");
-    setJustificativas([]);
-    setPlanilhaRows([]);
-    setPlanilhaCabecalhos([]);
-    setPlanilhaPreview([]);
-    setFileName(file.name);
-    setLoading(true);
+  // progresso
+  const [phase, setPhase] = useState<"idle" | "parsing" | "generating" | "done">("idle");
+  const [progress, setProgress] = useState({ done: 0, total: 0 });
 
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      try {
-        let rows: PlanilhaRow[] = [];
+  // ── Leitura do arquivo via Worker ─────────────────────────────────────────
+  const processFile = useCallback(
+    (file: File) => {
+      setError("");
+      setJustificativas([]);
+      setPlanilhaRows([]);
+      setPlanilhaCabecalhos([]);
+      setPlanilhaPreview([]);
+      setFileName(file.name);
+      setPhase("parsing");
+      setProgress({ done: 0, total: 0 });
 
-        if (file.name.toLowerCase().endsWith(".csv")) {
-          // CSV: lê como texto
-          const text = new TextDecoder("utf-8").decode(
-            new Uint8Array(e.target?.result as ArrayBuffer)
-          );
-          const lines = text.split(/\r?\n/).filter((l) => l.trim());
-          if (lines.length < 2) throw new Error("CSV vazio ou sem dados.");
-          const headers = lines[0].split(",").map((h) => h.trim().replace(/^"|"$/g, ""));
-          rows = lines.slice(1).map((line) => {
-            const cells = line.split(",").map((c) => c.trim().replace(/^"|"$/g, ""));
-            const obj: PlanilhaRow = {};
-            headers.forEach((h, i) => { obj[h] = cells[i] || ""; });
-            return obj;
-          });
-        } else {
-          // XLSX / XLS
-          const data = new Uint8Array(e.target?.result as ArrayBuffer);
-          const workbook = XLSX.read(data, { type: "array", cellDates: true });
-          const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      const worker = workerRef.current;
+      if (!worker) return;
 
-          // Tenta com cabeçalho (primeira linha = nomes das colunas)
-          const withHeader = XLSX.utils.sheet_to_json<PlanilhaRow>(sheet, {
-            defval: "",
-            raw: false,
-          });
+      // remove listener anterior
+      worker.onmessage = null;
 
-          if (withHeader.length > 0) {
-            rows = withHeader;
-          } else {
-            // Fallback: sem cabeçalho, gera nomes genéricos
-            const raw: string[][] = XLSX.utils.sheet_to_json(sheet, {
-              header: 1,
-              defval: "",
-              raw: false,
-            }) as string[][];
-            const headers =
-              raw[0]?.map((_, i) => `Coluna ${i + 1}`) || [];
-            rows = raw.slice(1).map((r) => {
-              const obj: PlanilhaRow = {};
-              headers.forEach((h, i) => { obj[h] = String(r[i] ?? ""); });
-              return obj;
-            });
-          }
+      worker.onmessage = (e: MessageEvent<WorkerOutMsg>) => {
+        const msg = e.data;
+        if (msg.type === "parsed") {
+          setPlanilhaRows(msg.rows);
+          setPlanilhaCabecalhos(msg.cabecalhos);
+          setPlanilhaPreview(msg.rows.slice(0, 5));
+          setPhase("idle");
+        } else if (msg.type === "error") {
+          setError(msg.message);
+          setPhase("idle");
         }
+      };
 
-        // Filtra linhas completamente vazias
-        rows = rows.filter((r) =>
-          Object.values(r).some((v) => String(v).trim().length > 0)
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        worker.postMessage(
+          { type: "parse", buffer: ev.target!.result as ArrayBuffer, fileName: file.name },
+          [ev.target!.result as ArrayBuffer]
         );
-
-        if (rows.length === 0) throw new Error("Nenhuma linha com dados foi encontrada.");
-
-        const cabecalhos = Object.keys(rows[0]);
-        setPlanilhaCabecalhos(cabecalhos);
-        setPlanilhaRows(rows);
-        setPlanilhaPreview(rows.slice(0, 5)); // mostra só as 5 primeiras como preview
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : "Erro ao ler o arquivo.";
-        setError(msg || "Erro ao ler o arquivo. Tente novamente com .xlsx, .xls ou .csv.");
-      } finally {
-        setLoading(false);
-      }
-    };
-    reader.readAsArrayBuffer(file);
-  }, []);
+      };
+      reader.readAsArrayBuffer(file);
+    },
+    [workerRef]
+  );
 
   const onDrop = useCallback(
-    (accepted: File[]) => {
-      if (accepted.length > 0) processFile(accepted[0]);
-    },
+    (accepted: File[]) => { if (accepted.length > 0) processFile(accepted[0]); },
     [processFile]
   );
 
@@ -121,48 +182,60 @@ export default function App() {
     multiple: false,
   });
 
-  // ── Gerar a partir da planilha carregada ────────────────────────────────────
-  const handleGerarDaPlanilha = () => {
-    if (planilhaRows.length === 0) {
-      setError("Carregue uma planilha antes de gerar.");
-      return;
-    }
-    setLoading(true);
-    setError("");
-    setTimeout(() => {
-      const resultado = gerarJustificativasDePlanilha(planilhaRows);
-      setJustificativas(resultado);
-      setLoading(false);
-    }, 600);
-  };
+  // ── Gerar da planilha via Worker (chunks) ─────────────────────────────────
+  const handleGerarDaPlanilha = useCallback(() => {
+    if (planilhaRows.length === 0) { setError("Carregue uma planilha antes de gerar."); return; }
 
-  // ── Gerar a partir do texto colado ──────────────────────────────────────────
+    const worker = workerRef.current;
+    if (!worker) return;
+
+    setError("");
+    setJustificativas([]);
+    setPhase("generating");
+    setProgress({ done: 0, total: planilhaRows.length });
+
+    const acumuladas: string[] = [];
+
+    worker.onmessage = (e: MessageEvent<WorkerOutMsg>) => {
+      const msg = e.data;
+      if (msg.type === "progress") {
+        acumuladas.push(...msg.batch);
+        setProgress({ done: msg.done, total: msg.total });
+        // Atualiza os cards enquanto processa (streaming de resultados)
+        setJustificativas([...acumuladas]);
+      } else if (msg.type === "done") {
+        setPhase("done");
+        setTimeout(() => setPhase("idle"), 1500);
+      } else if (msg.type === "error") {
+        setError(msg.message);
+        setPhase("idle");
+      }
+    };
+
+    // Chunk size adaptativo: planilhas grandes usam chunks maiores no worker
+    const chunkSize = planilhaRows.length > 500 ? 80 : planilhaRows.length > 100 ? 40 : 20;
+
+    worker.postMessage({ type: "generate", rows: planilhaRows, chunkSize });
+  }, [planilhaRows, workerRef]);
+
+  // ── Gerar do texto colado ─────────────────────────────────────────────────
   const handlePasteGenerate = () => {
     setError("");
-    if (!pastedText.trim()) {
-      setError("Cole algum conteúdo antes de gerar.");
-      return;
-    }
-    setLoading(true);
+    if (!pastedText.trim()) { setError("Cole algum conteúdo antes de gerar."); return; }
+    setPhase("generating");
     setTimeout(() => {
-      const lines = pastedText
-        .split(/\n/)
-        .map((l) => l.trim())
-        .filter((l) => l.length > 2);
-      const resultado = gerarJustificativas(lines);
+      const lines = pastedText.split(/\n/).map((l) => l.trim()).filter((l) => l.length > 2);
+      const resultado = gerarDeTexto(lines);
       setJustificativas(resultado);
-      setLoading(false);
-    }, 500);
+      setPhase("done");
+      setTimeout(() => setPhase("idle"), 1500);
+    }, 80);
   };
 
-  const handleCopy = (text: string) => {
-    navigator.clipboard.writeText(text);
-  };
-
+  // ── Copiar ────────────────────────────────────────────────────────────────
+  const handleCopy = (text: string) => { navigator.clipboard.writeText(text); };
   const handleCopyAll = () => {
-    const all = justificativas
-      .map((j, i) => `Justificativa ${i + 1}:\n${j}`)
-      .join("\n\n---\n\n");
+    const all = justificativas.map((j, i) => `Justificativa ${i + 1}:\n${j}`).join("\n\n---\n\n");
     navigator.clipboard.writeText(all);
     setCopyAllDone(true);
     setTimeout(() => setCopyAllDone(false), 2000);
@@ -176,7 +249,12 @@ export default function App() {
     setPlanilhaRows([]);
     setPlanilhaCabecalhos([]);
     setPlanilhaPreview([]);
+    setPhase("idle");
+    setProgress({ done: 0, total: 0 });
   };
+
+  const isLoading = phase === "parsing" || phase === "generating";
+  const pct = progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0;
 
   return (
     <div className="min-h-screen bg-[#080b12] relative overflow-x-hidden">
@@ -212,7 +290,7 @@ export default function App() {
             </div>
           </div>
           <p className="text-[#3a4a6a] text-xs mt-2 ml-4 pl-3">
-            Carregue uma planilha ou cole os dados diretamente para gerar justificativas operacionais.
+            Carregue uma planilha ou cole os dados para gerar justificativas operacionais.
           </p>
         </div>
 
@@ -221,26 +299,19 @@ export default function App() {
 
           {/* Tabs */}
           <div className="flex border-b border-white/6">
-            <button
-              onClick={() => setActiveTab("upload")}
-              className={`flex-1 py-3 px-5 text-xs font-semibold uppercase tracking-widest transition-all duration-200 ${
-                activeTab === "upload"
-                  ? "text-[#8ba2d4] border-b-2 border-[#2a4aaa] bg-[#0e1428]"
-                  : "text-[#3a4a6a] hover:text-[#6b82c4] border-b-2 border-transparent"
-              }`}
-            >
-              Upload de Planilha
-            </button>
-            <button
-              onClick={() => setActiveTab("colar")}
-              className={`flex-1 py-3 px-5 text-xs font-semibold uppercase tracking-widest transition-all duration-200 ${
-                activeTab === "colar"
-                  ? "text-[#8ba2d4] border-b-2 border-[#2a4aaa] bg-[#0e1428]"
-                  : "text-[#3a4a6a] hover:text-[#6b82c4] border-b-2 border-transparent"
-              }`}
-            >
-              Colar Dados
-            </button>
+            {(["upload", "colar"] as const).map((tab) => (
+              <button
+                key={tab}
+                onClick={() => setActiveTab(tab)}
+                className={`flex-1 py-3 px-5 text-xs font-semibold uppercase tracking-widest transition-all duration-200 ${
+                  activeTab === tab
+                    ? "text-[#8ba2d4] border-b-2 border-[#2a4aaa] bg-[#0e1428]"
+                    : "text-[#3a4a6a] hover:text-[#6b82c4] border-b-2 border-transparent"
+                }`}
+              >
+                {tab === "upload" ? "Upload de Planilha" : "Colar Dados"}
+              </button>
+            ))}
           </div>
 
           <div className="p-6">
@@ -254,7 +325,7 @@ export default function App() {
                   {...getRootProps()}
                   className={`border border-dashed rounded-lg p-8 text-center cursor-pointer transition-all duration-200 ${
                     isDragActive
-                      ? "border-[#2a4aaa] bg-[#0e1428]"
+                      ? "border-[#2a4aaa] bg-[#0e1428] scale-[1.01]"
                       : planilhaRows.length > 0
                       ? "border-[#1a3a20] bg-[#0a1a10]"
                       : "border-white/8 hover:border-white/16 hover:bg-white/2"
@@ -262,7 +333,7 @@ export default function App() {
                 >
                   <input {...getInputProps()} />
                   <div className="flex flex-col items-center gap-3">
-                    {/* Ícone planilha */}
+                    {/* Ícone planilha SVG */}
                     <svg width="36" height="36" viewBox="0 0 36 36" fill="none" className="opacity-50">
                       <rect x="4" y="2" width="28" height="32" rx="3" stroke="#6b82c4" strokeWidth="1.5" />
                       <line x1="4" y1="12" x2="32" y2="12" stroke="#6b82c4" strokeWidth="1" />
@@ -272,13 +343,25 @@ export default function App() {
                       <line x1="24" y1="12" x2="24" y2="34" stroke="#6b82c4" strokeWidth="1" />
                     </svg>
 
-                    {planilhaRows.length > 0 ? (
+                    {/* Fase: parsing */}
+                    {phase === "parsing" ? (
+                      <div className="flex flex-col items-center gap-2">
+                        <div className="flex gap-1">
+                          {[0, 1, 2, 3].map((i) => (
+                            <span
+                              key={i}
+                              className="w-1.5 h-1.5 bg-[#4a6aaa] rounded-full animate-bounce"
+                              style={{ animationDelay: `${i * 0.12}s` }}
+                            />
+                          ))}
+                        </div>
+                        <p className="text-[#6b82c4] text-sm">Lendo arquivo...</p>
+                      </div>
+                    ) : planilhaRows.length > 0 ? (
                       <>
-                        <p className="text-[#4caf80] text-sm font-semibold">
-                          {fileName}
-                        </p>
+                        <p className="text-[#4caf80] text-sm font-semibold">{fileName}</p>
                         <p className="text-[#3a5a40] text-xs">
-                          {planilhaRows.length} linha{planilhaRows.length !== 1 ? "s" : ""} carregada{planilhaRows.length !== 1 ? "s" : ""} · {planilhaCabecalhos.length} coluna{planilhaCabecalhos.length !== 1 ? "s" : ""}
+                          {planilhaRows.length.toLocaleString("pt-BR")} linha{planilhaRows.length !== 1 ? "s" : ""} carregada{planilhaRows.length !== 1 ? "s" : ""} · {planilhaCabecalhos.length} coluna{planilhaCabecalhos.length !== 1 ? "s" : ""}
                         </p>
                         <p className="text-[#2a3a4a] text-[10px]">
                           Clique ou arraste para substituir o arquivo
@@ -290,18 +373,18 @@ export default function App() {
                           {isDragActive ? "Solte o arquivo aqui" : "Arraste a planilha ou clique para selecionar"}
                         </p>
                         <p className="text-[#3a4a6a] text-xs">
-                          Formatos aceitos: .xlsx · .xls · .csv
+                          Formatos aceitos: .xlsx · .xls · .csv · Suporta milhares de linhas
                         </p>
                       </>
                     )}
                   </div>
                 </div>
 
-                {/* Preview das colunas detectadas */}
+                {/* Colunas detectadas */}
                 {planilhaCabecalhos.length > 0 && (
                   <div className="bg-[#080b12] border border-white/6 rounded-lg p-4">
                     <p className="text-[#4a5a8a] text-[10px] uppercase tracking-widest font-semibold mb-2">
-                      Colunas detectadas na planilha
+                      Colunas detectadas
                     </p>
                     <div className="flex flex-wrap gap-1.5">
                       {planilhaCabecalhos.map((h) => (
@@ -316,7 +399,7 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Preview das primeiras linhas */}
+                {/* Preview */}
                 {planilhaPreview.length > 0 && (
                   <div className="bg-[#080b12] border border-white/6 rounded-lg p-4 overflow-x-auto">
                     <p className="text-[#4a5a8a] text-[10px] uppercase tracking-widest font-semibold mb-3">
@@ -326,10 +409,7 @@ export default function App() {
                       <thead>
                         <tr>
                           {planilhaCabecalhos.slice(0, 8).map((h) => (
-                            <th
-                              key={h}
-                              className="text-left text-[#4a5a8a] font-semibold pb-2 pr-4 whitespace-nowrap border-b border-white/5 uppercase tracking-wide"
-                            >
+                            <th key={h} className="text-left text-[#4a5a8a] font-semibold pb-2 pr-4 whitespace-nowrap border-b border-white/5 uppercase tracking-wide">
                               {h}
                             </th>
                           ))}
@@ -344,26 +424,52 @@ export default function App() {
                         {planilhaPreview.map((row, ri) => (
                           <tr key={ri} className="border-b border-white/3">
                             {planilhaCabecalhos.slice(0, 8).map((h) => (
-                              <td
-                                key={h}
-                                className="text-[#7a8aaa] py-1.5 pr-4 whitespace-nowrap max-w-[140px] overflow-hidden text-ellipsis"
-                                title={row[h]}
-                              >
+                              <td key={h} className="text-[#7a8aaa] py-1.5 pr-4 whitespace-nowrap max-w-[140px] overflow-hidden text-ellipsis" title={row[h]}>
                                 {row[h] || <span className="text-[#2a3a4a]">—</span>}
                               </td>
                             ))}
-                            {planilhaCabecalhos.length > 8 && (
-                              <td className="text-[#2a3a5a] py-1.5">…</td>
-                            )}
+                            {planilhaCabecalhos.length > 8 && <td className="text-[#2a3a5a] py-1.5">…</td>}
                           </tr>
                         ))}
                       </tbody>
                     </table>
                     {planilhaRows.length > 5 && (
                       <p className="text-[#2a3a5a] text-[10px] mt-2">
-                        … e mais {planilhaRows.length - 5} linha{planilhaRows.length - 5 > 1 ? "s" : ""} que serão processadas.
+                        … e mais {(planilhaRows.length - 5).toLocaleString("pt-BR")} linha{planilhaRows.length - 5 > 1 ? "s" : ""} que serão processadas.
                       </p>
                     )}
+                  </div>
+                )}
+
+                {/* Barra de progresso durante geração */}
+                {phase === "generating" && progress.total > 0 && (
+                  <div className="bg-[#080b12] border border-white/6 rounded-lg p-4">
+                    <div className="flex justify-between items-center mb-2">
+                      <span className="text-[#6b82c4] text-xs font-semibold">
+                        Gerando justificativas...
+                      </span>
+                      <span className="text-[#4a5a8a] text-xs font-mono">
+                        {progress.done.toLocaleString("pt-BR")} / {progress.total.toLocaleString("pt-BR")} — {pct}%
+                      </span>
+                    </div>
+                    <div className="w-full h-1.5 bg-[#0e1428] rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-gradient-to-r from-[#1e3a8a] to-[#3b82f6] rounded-full transition-all duration-300"
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                    {justificativas.length > 0 && (
+                      <p className="text-[#3a5a40] text-[10px] mt-1.5">
+                        {justificativas.length.toLocaleString("pt-BR")} justificativa{justificativas.length !== 1 ? "s" : ""} gerada{justificativas.length !== 1 ? "s" : ""} até agora…
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {/* Conclusão */}
+                {phase === "done" && (
+                  <div className="bg-[#0a1a10] border border-[#1a5a30] rounded-lg px-4 py-3 text-[#4caf80] text-xs text-center font-semibold">
+                    {justificativas.length.toLocaleString("pt-BR")} justificativas geradas com sucesso.
                   </div>
                 )}
 
@@ -371,35 +477,31 @@ export default function App() {
                 {planilhaRows.length > 0 && (
                   <button
                     onClick={handleGerarDaPlanilha}
-                    disabled={loading}
-                    className="w-full flex items-center justify-center gap-2 bg-[#1a2a5a] hover:bg-[#1e3070] disabled:opacity-40 disabled:cursor-not-allowed text-[#8ba2d4] text-sm font-bold py-3 rounded-lg transition-all duration-200 border border-[#2a3a70] tracking-wide"
+                    disabled={isLoading}
+                    className="w-full flex items-center justify-center gap-2 bg-[#1a2a5a] hover:bg-[#1e3070] disabled:opacity-40 disabled:cursor-not-allowed text-[#8ba2d4] text-sm font-bold py-3.5 rounded-lg transition-all duration-200 border border-[#2a3a70] tracking-wide"
                   >
-                    {loading ? (
+                    {phase === "generating" ? (
                       <>
                         <span className="flex gap-1">
-                          {[0,1,2].map(i => (
-                            <span
-                              key={i}
-                              className="w-1.5 h-1.5 bg-[#4a6aaa] rounded-full animate-bounce"
-                              style={{ animationDelay: `${i * 0.15}s` }}
-                            />
+                          {[0, 1, 2].map((i) => (
+                            <span key={i} className="w-1.5 h-1.5 bg-[#4a6aaa] rounded-full animate-bounce" style={{ animationDelay: `${i * 0.15}s` }} />
                           ))}
                         </span>
-                        Processando {planilhaRows.length} linha{planilhaRows.length > 1 ? "s" : ""}...
+                        Processando {progress.done.toLocaleString("pt-BR")} / {progress.total.toLocaleString("pt-BR")} linhas...
                       </>
                     ) : (
                       <>
                         <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                          <path d="M2 8h12M10 4l4 4-4 4" stroke="#8ba2d4" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                          <path d="M2 8h12M10 4l4 4-4 4" stroke="#8ba2d4" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
                         </svg>
-                        Gerar Justificativas — {planilhaRows.length} linha{planilhaRows.length > 1 ? "s" : ""}
+                        Gerar Justificativas — {planilhaRows.length.toLocaleString("pt-BR")} linha{planilhaRows.length !== 1 ? "s" : ""}
                       </>
                     )}
                   </button>
                 )}
 
                 <p className="text-[#2a3a5a] text-[10px] text-center">
-                  Processamento local — nenhum dado é enviado a servidores externos.
+                  Processamento 100% local · Web Worker · sem envio de dados externos
                 </p>
               </div>
             )}
@@ -420,18 +522,14 @@ export default function App() {
                 />
                 <button
                   onClick={handlePasteGenerate}
-                  disabled={loading}
-                  className="mt-3 w-full flex items-center justify-center gap-2 bg-[#1a2a5a] hover:bg-[#1e3070] disabled:opacity-40 disabled:cursor-not-allowed text-[#8ba2d4] text-sm font-bold py-3 rounded-lg transition-all duration-200 border border-[#2a3a70] tracking-wide"
+                  disabled={isLoading}
+                  className="mt-3 w-full flex items-center justify-center gap-2 bg-[#1a2a5a] hover:bg-[#1e3070] disabled:opacity-40 disabled:cursor-not-allowed text-[#8ba2d4] text-sm font-bold py-3.5 rounded-lg transition-all duration-200 border border-[#2a3a70] tracking-wide"
                 >
-                  {loading ? (
+                  {isLoading ? (
                     <>
                       <span className="flex gap-1">
-                        {[0,1,2].map(i => (
-                          <span
-                            key={i}
-                            className="w-1.5 h-1.5 bg-[#4a6aaa] rounded-full animate-bounce"
-                            style={{ animationDelay: `${i * 0.15}s` }}
-                          />
+                        {[0, 1, 2].map((i) => (
+                          <span key={i} className="w-1.5 h-1.5 bg-[#4a6aaa] rounded-full animate-bounce" style={{ animationDelay: `${i * 0.15}s` }} />
                         ))}
                       </span>
                       Processando...
@@ -439,7 +537,7 @@ export default function App() {
                   ) : (
                     <>
                       <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                        <path d="M2 8h12M10 4l4 4-4 4" stroke="#8ba2d4" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                        <path d="M2 8h12M10 4l4 4-4 4" stroke="#8ba2d4" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
                       </svg>
                       Gerar Justificativas
                     </>
@@ -458,19 +556,23 @@ export default function App() {
         </div>
 
         {/* ── RESULTADOS ── */}
-        {justificativas.length > 0 && !loading && (
+        {justificativas.length > 0 && (
           <div>
             <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
               <div className="flex items-center gap-2">
                 <div className="w-1 h-5 bg-[#2a4aaa] rounded-full" />
                 <span className="text-[#8ba2d4] text-sm font-semibold">
-                  {justificativas.length} justificativa{justificativas.length !== 1 ? "s" : ""} gerada{justificativas.length !== 1 ? "s" : ""}
+                  {justificativas.length.toLocaleString("pt-BR")} justificativa{justificativas.length !== 1 ? "s" : ""} gerada{justificativas.length !== 1 ? "s" : ""}
+                  {phase === "generating" && (
+                    <span className="ml-2 text-[#4a5a8a] text-xs font-normal">· gerando...</span>
+                  )}
                 </span>
               </div>
               <div className="flex gap-2">
                 <button
                   onClick={handleCopyAll}
-                  className={`text-xs font-medium px-4 py-2 rounded border transition-all duration-200 ${
+                  disabled={phase === "generating"}
+                  className={`text-xs font-medium px-4 py-2 rounded border transition-all duration-200 disabled:opacity-40 ${
                     copyAllDone
                       ? "bg-[#0d2a1a] border-[#1a5a30] text-[#4caf80]"
                       : "bg-[#0c1428] border-[#1e2e50] text-[#6b82c4] hover:border-[#2a4080] hover:text-[#8ba2d4]"
